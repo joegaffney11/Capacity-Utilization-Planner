@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+import math
 
 # Page configuration
 st.set_page_config(page_title="Capacity Analysis Dashboard", layout="wide", initial_sidebar_state="expanded")
@@ -339,7 +340,7 @@ class CapacityAnalyzer:
             self.capacity_results[year] = pd.DataFrame(rows)
     
     def create_machine_data(self, allocation_file):
-        """Create machine data based on operation allocation."""
+        """Create machine data based on operation allocation with support for split allocations."""
         allocation = pd.read_excel(allocation_file)
         machines = [col for col in allocation.columns if col not in ['Operations', 'Total']]
         
@@ -356,12 +357,75 @@ class CapacityAnalyzer:
             machine_data[year] = {}
             
             for machine in machines:
-                machine_ops = allocation[allocation[machine] == 1]['Operations'].tolist()
+                # Get operations with their allocation percentages for this machine
+                machine_allocation = allocation[['Operations', machine]].copy()
+                machine_allocation = machine_allocation[machine_allocation[machine] > 0]
                 
-                machine_df = capacity_data[
-                    (capacity_data['Operation'].isin(machine_ops)) & 
-                    (capacity_data['On-Machine Minutes'] > 0)
-                ].copy()
+                # Create empty list to store all rows for this machine
+                machine_rows = []
+                
+                for _, alloc_row in machine_allocation.iterrows():
+                    operation = alloc_row['Operations']
+                    allocation_pct = alloc_row[machine]
+                    
+                    # Get all capacity data for this operation
+                    op_data = capacity_data[
+                        (capacity_data['Operation'] == operation) & 
+                        (capacity_data['On-Machine Minutes'] > 0)
+                    ].copy()
+                    
+                    if not op_data.empty:
+                        # Check if this operation is split across multiple machines
+                        op_total_allocation = allocation[allocation['Operations'] == operation][machines].sum(axis=1).values[0]
+                        
+                        if op_total_allocation > 0:
+                            # Normalize allocation percentage if total is not 1
+                            normalized_pct = allocation_pct / op_total_allocation
+                            
+                            # Check if this is the first machine in the allocation for this operation
+                            # (to handle remainder)
+                            machines_with_allocation = []
+                            for m in machines:
+                                if allocation[allocation['Operations'] == operation][m].values[0] > 0:
+                                    machines_with_allocation.append(m)
+                            is_first_machine = (machine == machines_with_allocation[0])
+                            
+                            # Split quantities according to allocation percentage
+                            for idx, row in op_data.iterrows():
+                                original_qty = row['Quantity']
+                                rate = row['Rate (minutes/part)']
+                                
+                                # Calculate split quantity
+                                split_qty = original_qty * normalized_pct
+                                
+                                # If this is the first machine, add the remainder rounded up
+                                if is_first_machine and len(machines_with_allocation) > 1:
+                                    # Calculate what would be distributed to other machines
+                                    other_qty = 0
+                                    for other_machine in machines_with_allocation[1:]:
+                                        other_alloc = allocation[allocation['Operations'] == operation][other_machine].values[0]
+                                        other_normalized_pct = other_alloc / op_total_allocation
+                                        other_qty += math.floor(original_qty * other_normalized_pct)
+                                    
+                                    # First machine gets the remainder to ensure total matches
+                                    split_qty = original_qty - other_qty
+                                else:
+                                    # Other machines get floored values
+                                    split_qty = math.floor(split_qty)
+                                
+                                machine_rows.append({
+                                    'Part Number': row['Part Number'],
+                                    'Operation': operation,
+                                    'Quantity': split_qty,
+                                    'Rate (minutes/part)': rate,
+                                    'On-Machine Minutes': split_qty * rate
+                                })
+                
+                # Create dataframe from all rows
+                if machine_rows:
+                    machine_df = pd.DataFrame(machine_rows)
+                else:
+                    machine_df = pd.DataFrame(columns=['Part Number', 'Operation', 'Quantity', 'Rate (minutes/part)', 'On-Machine Minutes'])
 
                 # Calculate totals
                 total_minutes = machine_df['On-Machine Minutes'].sum()
@@ -487,14 +551,6 @@ try:
         analyzer.operation_lines()
         machine_data, machines = analyzer.create_machine_data(allocation_file)
     
-    # Check for merge errors
-    with st.expander("📋 Data Quality Check"):
-        errors = analyzer.check_merge_errors()
-        for error in errors:
-            if "WARNING" in error:
-                st.warning(error)
-            else:
-                st.success(error)
     
     # Initialize session state for selected year
     if 'selected_year' not in st.session_state:
@@ -509,7 +565,7 @@ try:
         
         with st.container(border=True):
             # All year buttons in one row
-            years_display = [year.replace(' Qty', '') for year in analyzer.years]
+            years_display = [str(year).replace(' Qty', '') for year in analyzer.years]
             cols = st.columns(len(years_display), gap="small")
             
             for year_idx, (col, year_display, year_value) in enumerate(zip(cols, years_display, analyzer.years)):
@@ -561,7 +617,7 @@ try:
     
     with col_right:
         # Machine Details Section - All machines vertically
-        year_display = st.session_state.selected_year.replace(' Qty', '')
+        year_display = str(st.session_state.selected_year).replace(' Qty', '')
         st.markdown(f"<h2>🔧 Machine Details - {year_display}</h2>", unsafe_allow_html=True)
         
         # Create machine cards vertically (one per row)
@@ -608,7 +664,7 @@ try:
                         if not machine_df.empty:
                             # Format the dataframe for display
                             display_df = machine_df.copy()
-                            display_df['Quantity'] = display_df['Quantity'].fillna(0).astype(int)
+                            display_df['Quantity'] = display_df['Quantity'].fillna(0).round(2)
                             display_df['Rate (minutes/part)'] = display_df['Rate (minutes/part)'].fillna(0).round(2)
                             display_df['On-Machine Minutes'] = display_df['On-Machine Minutes'].fillna(0).round(2)
                             
@@ -619,7 +675,7 @@ try:
                             summary_row = pd.DataFrame({
                                 'Part Number': ['TOTAL'],
                                 'Operation': [''],
-                                'Quantity': [int(display_df['Quantity'].sum())],
+                                'Quantity': [float(display_df['Quantity'].sum())],
                                 'Rate (minutes/part)': [0.0],
                                 'On-Machine Minutes': [float(display_df['On-Machine Minutes'].sum())]
                             })
